@@ -73,6 +73,8 @@ bool VPRecipeBase::mayWriteToMemory() const {
   case VPBlendSC:
   case VPReductionEVLSC:
   case VPReductionSC:
+  case VPExtendedReductionSC:
+  case VPMulAccumulateReductionSC:
   case VPVectorPointerSC:
   case VPWidenCanonicalIVSC:
   case VPWidenCastSC:
@@ -120,6 +122,8 @@ bool VPRecipeBase::mayReadFromMemory() const {
   case VPBlendSC:
   case VPReductionEVLSC:
   case VPReductionSC:
+  case VPExtendedReductionSC:
+  case VPMulAccumulateReductionSC:
   case VPVectorPointerSC:
   case VPWidenCanonicalIVSC:
   case VPWidenCastSC:
@@ -157,6 +161,8 @@ bool VPRecipeBase::mayHaveSideEffects() const {
   case VPBlendSC:
   case VPReductionEVLSC:
   case VPReductionSC:
+  case VPExtendedReductionSC:
+  case VPMulAccumulateReductionSC:
   case VPScalarIVStepsSC:
   case VPVectorPointerSC:
   case VPWidenCanonicalIVSC:
@@ -456,6 +462,26 @@ Value *VPInstruction::generatePerLane(VPTransformState &State,
                               State.get(getOperand(1), Lane), Name);
 }
 
+/// Create a conditional branch using \p Cond branching to the successors of \p
+/// VPBB. Note that the first successor is always forward (i.e. not created yet)
+/// while the second successor may already have been created (if it is a header
+/// block and VPBB is a latch).
+static BranchInst *createCondBranch(Value *Cond, VPBasicBlock *VPBB,
+                                    VPTransformState &State) {
+  // Replace the temporary unreachable terminator with a new conditional
+  // branch, hooking it up to backward destination (header) for latch blocks
+  // now, and to forward destination(s) later when they are created.
+  // Second successor may be backwards - iff it is already in VPBB2IRBB.
+  VPBasicBlock *SecondVPSucc = cast<VPBasicBlock>(VPBB->getSuccessors()[1]);
+  BasicBlock *SecondIRSucc = State.CFG.VPBB2IRBB.lookup(SecondVPSucc);
+  BasicBlock *IRBB = State.CFG.VPBB2IRBB[VPBB];
+  BranchInst *CondBr = State.Builder.CreateCondBr(Cond, IRBB, SecondIRSucc);
+  // First successor is always forward, reset it to nullptr
+  CondBr->setSuccessor(0, nullptr);
+  IRBB->getTerminator()->eraseFromParent();
+  return CondBr;
+}
+
 Value *VPInstruction::generate(VPTransformState &State) {
   IRBuilderBase &Builder = State.Builder;
 
@@ -575,43 +601,14 @@ Value *VPInstruction::generate(VPTransformState &State) {
   }
   case VPInstruction::BranchOnCond: {
     Value *Cond = State.get(getOperand(0), VPLane(0));
-    // Replace the temporary unreachable terminator with a new conditional
-    // branch, hooking it up to backward destination for exiting blocks now and
-    // to forward destination(s) later when they are created.
-    BranchInst *CondBr =
-        Builder.CreateCondBr(Cond, Builder.GetInsertBlock(), nullptr);
-    CondBr->setSuccessor(0, nullptr);
-    Builder.GetInsertBlock()->getTerminator()->eraseFromParent();
-
-    if (!getParent()->isExiting())
-      return CondBr;
-
-    VPRegionBlock *ParentRegion = getParent()->getParent();
-    VPBasicBlock *Header = ParentRegion->getEntryBasicBlock();
-    CondBr->setSuccessor(1, State.CFG.VPBB2IRBB[Header]);
-    return CondBr;
+    return createCondBranch(Cond, getParent(), State);
   }
   case VPInstruction::BranchOnCount: {
     // First create the compare.
     Value *IV = State.get(getOperand(0), /*IsScalar*/ true);
     Value *TC = State.get(getOperand(1), /*IsScalar*/ true);
     Value *Cond = Builder.CreateICmpEQ(IV, TC);
-
-    // Now create the branch.
-    auto *Plan = getParent()->getPlan();
-    VPRegionBlock *TopRegion = Plan->getVectorLoopRegion();
-    VPBasicBlock *Header = TopRegion->getEntry()->getEntryBasicBlock();
-
-    // Replace the temporary unreachable terminator with a new conditional
-    // branch, hooking it up to backward destination (the header) now and to the
-    // forward destination (the exit/middle block) later when it is created.
-    // Note that CreateCondBr expects a valid BB as first argument, so we need
-    // to set it to nullptr later.
-    BranchInst *CondBr = Builder.CreateCondBr(Cond, Builder.GetInsertBlock(),
-                                              State.CFG.VPBB2IRBB[Header]);
-    CondBr->setSuccessor(0, nullptr);
-    Builder.GetInsertBlock()->getTerminator()->eraseFromParent();
-    return CondBr;
+    return createCondBranch(Cond, getParent(), State);
   }
   case VPInstruction::Broadcast: {
     return Builder.CreateVectorSplat(
@@ -672,10 +669,6 @@ Value *VPInstruction::generate(VPTransformState &State) {
     }
     // Reduce all of the unrolled parts into a single vector.
     Value *ReducedPartRdx = RdxParts[0];
-    unsigned Op = RdxDesc.getOpcode();
-    if (RecurrenceDescriptor::isAnyOfRecurrenceKind(RK))
-      Op = Instruction::Or;
-
     if (PhiR->isOrdered()) {
       ReducedPartRdx = RdxParts[UF - 1];
     } else {
@@ -684,11 +677,12 @@ Value *VPInstruction::generate(VPTransformState &State) {
       Builder.setFastMathFlags(RdxDesc.getFastMathFlags());
       for (unsigned Part = 1; Part < UF; ++Part) {
         Value *RdxPart = RdxParts[Part];
-        if (Op != Instruction::ICmp && Op != Instruction::FCmp)
-          ReducedPartRdx = Builder.CreateBinOp(
-              (Instruction::BinaryOps)Op, RdxPart, ReducedPartRdx, "bin.rdx");
-        else
+        if (RecurrenceDescriptor::isMinMaxRecurrenceKind(RK))
           ReducedPartRdx = createMinMaxOp(Builder, RK, ReducedPartRdx, RdxPart);
+        else
+          ReducedPartRdx =
+              Builder.CreateBinOp((Instruction::BinaryOps)RdxDesc.getOpcode(),
+                                  RdxPart, ReducedPartRdx, "bin.rdx");
       }
     }
 
@@ -1124,10 +1118,6 @@ void VPInstructionWithType::print(raw_ostream &O, const Twine &Indent,
 
 void VPPhi::execute(VPTransformState &State) {
   State.setDebugLocFrom(getDebugLoc());
-  assert(getParent() ==
-             getParent()->getPlan()->getVectorLoopRegion()->getEntry() &&
-         "VPInstructions with PHI opcodes must be used for header phis only "
-         "at the moment");
   BasicBlock *VectorPH = State.CFG.VPBB2IRBB.at(getIncomingBlock(0));
   Value *Start = State.get(getIncomingValue(0), VPLane(0));
   PHINode *Phi = State.Builder.CreatePHI(Start->getType(), 2, getName());
@@ -1190,7 +1180,7 @@ void VPIRPhi::execute(VPTransformState &State) {
   PHINode *Phi = &getIRPhi();
   for (const auto &[Idx, Op] : enumerate(operands())) {
     VPValue *ExitValue = Op;
-    auto Lane = vputils::isUniformAfterVectorization(ExitValue)
+    auto Lane = vputils::isSingleScalar(ExitValue)
                     ? VPLane::getFirstLane()
                     : VPLane::getLastLaneForVF(State.VF);
     VPBlockBase *Pred = getParent()->getPredecessors()[Idx];
@@ -1785,10 +1775,7 @@ InstructionCost VPWidenRecipe::computeCost(ElementCount VF,
     VPValue *RHS = getOperand(1);
     // Certain instructions can be cheaper to vectorize if they have a constant
     // second vector operand. One example of this are shifts on x86.
-    TargetTransformInfo::OperandValueInfo RHSInfo = {
-        TargetTransformInfo::OK_AnyValue, TargetTransformInfo::OP_None};
-    if (RHS->isLiveIn())
-      RHSInfo = Ctx.TTI.getOperandInfo(RHS->getLiveInIRValue());
+    TargetTransformInfo::OperandValueInfo RHSInfo = Ctx.getOperandInfo(RHS);
 
     if (RHSInfo.Kind == TargetTransformInfo::OK_AnyValue &&
         getOperand(1)->isDefinedOutsideLoopRegions())
@@ -2525,15 +2512,11 @@ InstructionCost VPReductionRecipe::computeCost(ElementCount VF,
   unsigned Opcode = RecurrenceDescriptor::getOpcode(RdxKind);
   FastMathFlags FMFs = getFastMathFlags();
 
-  // TODO: Support any-of and in-loop reductions.
+  // TODO: Support any-of reductions.
   assert(
       (!RecurrenceDescriptor::isAnyOfRecurrenceKind(RdxKind) ||
        ForceTargetInstructionCost.getNumOccurrences() > 0) &&
       "Any-of reduction not implemented in VPlan-based cost model currently.");
-  assert(
-      (!cast<VPReductionPHIRecipe>(getOperand(0))->isInLoop() ||
-       ForceTargetInstructionCost.getNumOccurrences() > 0) &&
-      "In-loop reduction not implemented in VPlan-based cost model currently.");
 
   // Cost = Reduction cost + BinOp cost
   InstructionCost Cost =
@@ -2590,6 +2573,59 @@ void VPReductionEVLRecipe::print(raw_ostream &O, const Twine &Indent,
   }
   O << ")";
 }
+
+void VPExtendedReductionRecipe::print(raw_ostream &O, const Twine &Indent,
+                                      VPSlotTracker &SlotTracker) const {
+  O << Indent << "EXTENDED-REDUCE ";
+  printAsOperand(O, SlotTracker);
+  O << " = ";
+  getChainOp()->printAsOperand(O, SlotTracker);
+  O << " +";
+  O << " reduce."
+    << Instruction::getOpcodeName(
+           RecurrenceDescriptor::getOpcode(getRecurrenceKind()))
+    << " (";
+  getVecOp()->printAsOperand(O, SlotTracker);
+  printFlags(O);
+  O << Instruction::getOpcodeName(ExtOp) << " to " << *getResultType();
+  if (isConditional()) {
+    O << ", ";
+    getCondOp()->printAsOperand(O, SlotTracker);
+  }
+  O << ")";
+}
+
+void VPMulAccumulateReductionRecipe::print(raw_ostream &O, const Twine &Indent,
+                                           VPSlotTracker &SlotTracker) const {
+  O << Indent << "MULACC-REDUCE ";
+  printAsOperand(O, SlotTracker);
+  O << " = ";
+  getChainOp()->printAsOperand(O, SlotTracker);
+  O << " + ";
+  O << "reduce."
+    << Instruction::getOpcodeName(
+           RecurrenceDescriptor::getOpcode(getRecurrenceKind()))
+    << " (";
+  O << "mul";
+  printFlags(O);
+  if (isExtended())
+    O << "(";
+  getVecOp0()->printAsOperand(O, SlotTracker);
+  if (isExtended())
+    O << " " << Instruction::getOpcodeName(ExtOp) << " to " << *getResultType()
+      << "), (";
+  else
+    O << ", ";
+  getVecOp1()->printAsOperand(O, SlotTracker);
+  if (isExtended())
+    O << " " << Instruction::getOpcodeName(ExtOp) << " to " << *getResultType()
+      << ")";
+  if (isConditional()) {
+    O << ", ";
+    getCondOp()->printAsOperand(O, SlotTracker);
+  }
+  O << ")";
+}
 #endif
 
 /// A helper function to scalarize a single Instruction in the innermost loop.
@@ -2627,7 +2663,7 @@ static void scalarizeInstruction(const Instruction *Instr,
   for (const auto &I : enumerate(RepRecipe->operands())) {
     auto InputLane = Lane;
     VPValue *Operand = I.value();
-    if (vputils::isUniformAfterVectorization(Operand))
+    if (vputils::isSingleScalar(Operand))
       InputLane = VPLane::getFirstLane();
     Cloned->setOperand(I.index(), State.get(Operand, InputLane));
   }
@@ -2653,7 +2689,7 @@ static void scalarizeInstruction(const Instruction *Instr,
 void VPReplicateRecipe::execute(VPTransformState &State) {
   Instruction *UI = getUnderlyingInstr();
   if (State.Lane) { // Generate a single instance.
-    assert((State.VF.isScalar() || !isUniform()) &&
+    assert((State.VF.isScalar() || !isSingleScalar()) &&
            "uniform recipe shouldn't be predicated");
     assert(!State.VF.isScalable() && "Can't scalarize a scalable vector");
     scalarizeInstruction(UI, this, *State.Lane, State);
@@ -2671,7 +2707,7 @@ void VPReplicateRecipe::execute(VPTransformState &State) {
     return;
   }
 
-  if (IsUniform) {
+  if (IsSingleScalar) {
     // Uniform within VL means we need to generate lane 0.
     scalarizeInstruction(UI, this, VPLane(0), State);
     return;
@@ -2679,8 +2715,7 @@ void VPReplicateRecipe::execute(VPTransformState &State) {
 
   // A store of a loop varying value to a uniform address only needs the last
   // copy of the store.
-  if (isa<StoreInst>(UI) &&
-      vputils::isUniformAfterVectorization(getOperand(1))) {
+  if (isa<StoreInst>(UI) && vputils::isSingleScalar(getOperand(1))) {
     auto Lane = VPLane::getLastLaneForVF(State.VF);
     scalarizeInstruction(UI, this, VPLane(Lane), State);
     return;
@@ -2741,7 +2776,7 @@ InstructionCost VPReplicateRecipe::computeCost(ElementCount VF,
                UI->getOpcode(), ResultTy, CostKind,
                {TargetTransformInfo::OK_AnyValue, TargetTransformInfo::OP_None},
                Op2Info, Operands, UI, &Ctx.TLI) *
-           (isUniform() ? 1 : VF.getKnownMinValue());
+           (isSingleScalar() ? 1 : VF.getKnownMinValue());
   }
   }
 
@@ -2751,7 +2786,7 @@ InstructionCost VPReplicateRecipe::computeCost(ElementCount VF,
 #if !defined(NDEBUG) || defined(LLVM_ENABLE_DUMP)
 void VPReplicateRecipe::print(raw_ostream &O, const Twine &Indent,
                               VPSlotTracker &SlotTracker) const {
-  O << Indent << (IsUniform ? "CLONE " : "REPLICATE ");
+  O << Indent << (IsSingleScalar ? "CLONE " : "REPLICATE ");
 
   if (!getUnderlyingInstr()->getType()->isVoidTy()) {
     printAsOperand(O, SlotTracker);
@@ -2888,8 +2923,9 @@ InstructionCost VPWidenMemoryRecipe::computeCost(ElementCount VF,
     Cost +=
         Ctx.TTI.getMaskedMemoryOpCost(Opcode, Ty, Alignment, AS, Ctx.CostKind);
   } else {
-    TTI::OperandValueInfo OpInfo =
-        Ctx.TTI.getOperandInfo(Ingredient.getOperand(0));
+    TTI::OperandValueInfo OpInfo = Ctx.getOperandInfo(
+        isa<VPWidenLoadRecipe, VPWidenLoadEVLRecipe>(this) ? getOperand(0)
+                                                           : getOperand(1));
     Cost += Ctx.TTI.getMemoryOpCost(Opcode, Ty, Alignment, AS, Ctx.CostKind,
                                     OpInfo, &Ingredient);
   }
@@ -3010,7 +3046,7 @@ InstructionCost VPWidenLoadEVLRecipe::computeCost(ElementCount VF,
   unsigned AS =
       getLoadStoreAddressSpace(const_cast<Instruction *>(&Ingredient));
   InstructionCost Cost = Ctx.TTI.getMaskedMemoryOpCost(
-      Ingredient.getOpcode(), Ty, Alignment, AS, Ctx.CostKind);
+      Instruction::Load, Ty, Alignment, AS, Ctx.CostKind);
   if (!Reverse)
     return Cost;
 
@@ -3125,7 +3161,7 @@ InstructionCost VPWidenStoreEVLRecipe::computeCost(ElementCount VF,
   unsigned AS =
       getLoadStoreAddressSpace(const_cast<Instruction *>(&Ingredient));
   InstructionCost Cost = Ctx.TTI.getMaskedMemoryOpCost(
-      Ingredient.getOpcode(), Ty, Alignment, AS, Ctx.CostKind);
+      Instruction::Store, Ty, Alignment, AS, Ctx.CostKind);
   if (!Reverse)
     return Cost;
 
