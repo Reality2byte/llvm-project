@@ -971,6 +971,7 @@ void CodeGenModule::Release() {
         getModule(), Int8Ty, false, llvm::GlobalValue::ExternalLinkage,
         llvm::Constant::getNullValue(Int8Ty),
         "__hip_cuid_" + getContext().getCUIDHash());
+    getSanitizerMetadata()->disableSanitizerForGlobal(GV);
     addCompilerUsedGlobal(GV);
   }
   emitLLVMUsed();
@@ -1689,7 +1690,7 @@ static bool shouldAssumeDSOLocal(const CodeGenModule &CGM,
 
   const llvm::Triple &TT = CGM.getTriple();
   const auto &CGOpts = CGM.getCodeGenOpts();
-  if (TT.isWindowsGNUEnvironment()) {
+  if (TT.isOSCygMing()) {
     // In MinGW, variables without DLLImport can still be automatically
     // imported from a DLL by the linker; don't mark variables that
     // potentially could come from another DLL as DSO local.
@@ -3274,9 +3275,11 @@ void CodeGenModule::EmitModuleLinkOptions() {
   LinkerOptionsMetadata.append(MetadataArgs.begin(), MetadataArgs.end());
 
   // Add the linker options metadata flag.
-  auto *NMD = getModule().getOrInsertNamedMetadata("llvm.linker.options");
-  for (auto *MD : LinkerOptionsMetadata)
-    NMD->addOperand(MD);
+  if (!LinkerOptionsMetadata.empty()) {
+    auto *NMD = getModule().getOrInsertNamedMetadata("llvm.linker.options");
+    for (auto *MD : LinkerOptionsMetadata)
+      NMD->addOperand(MD);
+  }
 }
 
 void CodeGenModule::EmitDeferred() {
@@ -4061,11 +4064,7 @@ namespace {
         return false;
       std::string BuiltinNameStr = BI.getName(BuiltinID);
       StringRef BuiltinName = BuiltinNameStr;
-      if (BuiltinName.starts_with("__builtin_") &&
-          Name == BuiltinName.slice(strlen("__builtin_"), StringRef::npos)) {
-        return true;
-      }
-      return false;
+      return BuiltinName.consume_front("__builtin_") && Name == BuiltinName;
     }
 
     bool VisitStmt(const Stmt *S) {
@@ -7123,7 +7122,7 @@ void CodeGenModule::EmitTopLevelDecl(Decl *D) {
     }
     // Emit any static data members, they may be definitions.
     for (auto *I : CRD->decls())
-      if (isa<VarDecl>(I) || isa<CXXRecordDecl>(I))
+      if (isa<VarDecl>(I) || isa<CXXRecordDecl>(I) || isa<EnumDecl>(I))
         EmitTopLevelDecl(I);
     break;
   }
