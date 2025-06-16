@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "LanaiMCExpr.h"
+#include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAssembler.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCStreamer.h"
@@ -14,14 +15,14 @@ using namespace llvm;
 
 #define DEBUG_TYPE "lanaimcexpr"
 
-const LanaiMCExpr *LanaiMCExpr::create(VariantKind Kind, const MCExpr *Expr,
+const LanaiMCExpr *LanaiMCExpr::create(Spec S, const MCExpr *Expr,
                                        MCContext &Ctx) {
-  return new (Ctx) LanaiMCExpr(Kind, Expr);
+  return new (Ctx) LanaiMCExpr(Expr, S);
 }
 
 void LanaiMCExpr::printImpl(raw_ostream &OS, const MCAsmInfo *MAI) const {
   if (specifier == VK_Lanai_None) {
-    Expr->print(OS, MAI);
+    MAI->printExpr(OS, *Expr);
     return;
   }
 
@@ -38,18 +39,6 @@ void LanaiMCExpr::printImpl(raw_ostream &OS, const MCAsmInfo *MAI) const {
 
   OS << '(';
   const MCExpr *Expr = getSubExpr();
-  Expr->print(OS, MAI);
+  MAI->printExpr(OS, *Expr);
   OS << ')';
-}
-
-void LanaiMCExpr::visitUsedExpr(MCStreamer &Streamer) const {
-  Streamer.visitUsedExpr(*getSubExpr());
-}
-
-bool LanaiMCExpr::evaluateAsRelocatableImpl(MCValue &Res,
-                                            const MCAssembler *Asm) const {
-  if (!getSubExpr()->evaluateAsRelocatable(Res, Asm))
-    return false;
-  Res.setSpecifier(specifier);
-  return true;
 }
